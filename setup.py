@@ -11,7 +11,7 @@ requirements = [
     "safetensors",
     "pydantic",
     "huggingface-hub",
-    "tokenizerz==0.0.2a5",
+    "tokenizerz==0.0.2a7",
 ]
 
 extras_require = {
@@ -23,7 +23,7 @@ setup(
     name='nnx-lm',
     url='https://github.com/jaco-bro/nnx-lm',
     packages=find_packages(),
-    version='0.0.1a2',
+    version='0.0.1',
     readme="README.md",
     author_email="backupjjoe@gmail.com",
     description="nnx-lm: A portable, pip-installable CLI for running LLMs via JAX on any hardware backend.",

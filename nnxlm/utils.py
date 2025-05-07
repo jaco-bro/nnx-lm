@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, fields
 from typing import List, Tuple, Optional, Dict, Any, Union, Type, Callable
 from flax import nnx
-from safetensors.numpy import load_file
+from safetensors.flax import load_file
 from glob import glob
 from tokenizerz import Tokenizer
 
@@ -35,9 +35,9 @@ def download_file(url, path, desc):
     with tqdm(unit='B', unit_scale=True, desc=desc, leave=False) as t:
         urlretrieve(url, path, reporthook=tqdm_hook(t))
 
-def get_model_files(repo, model):
+def get_model_files(repo, model, dest=None):
     base_url = f"https://huggingface.co/{repo}/{model}/resolve/main"
-    model_dir = model
+    model_dir = model if dest is None else os.path.join(dest, model)
     os.makedirs(model_dir, exist_ok=True)
     index_path = os.path.join(model_dir, "model.safetensors.index.json")
     files = ["config.json", "tokenizer.json", "tokenizer_config.json"]
@@ -55,24 +55,26 @@ def get_model_files(repo, model):
         else:
             files.append(pattern)
     except Exception:
-        print("Falling back to default file list.")
         files.append("model.safetensors")
-    return [(f"{base_url}/{file}", os.path.join(model_dir, file), file) for file in files]
+    return model_dir, [(f"{base_url}/{file}", os.path.join(model_dir, file), file) for file in files]
 
-def download_model(repo, model, max_workers=4):
-    tasks = get_model_files(repo, model)
+def download_model(repo, model, dest=None, max_workers=4):
+    model_dir, tasks = get_model_files(repo, model, dest)
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(download_file, url, path, desc) for url, path, desc in tasks]
         for future in futures:
             future.result()
+    return model_dir
 
 @dataclass
 class Config:
+    architectures: List[str]
     model_type: str
     hidden_size: int
     num_hidden_layers: int
     intermediate_size: int
     num_attention_heads: int
+    eos_token_id: str
     rms_norm_eps: float = 1e-6
     vocab_size: int = 0
     num_key_value_heads: int = None 
@@ -92,17 +94,22 @@ class Config:
         if self.head_dim is None:
             self.head_dim = self.hidden_size // self.num_attention_heads
 
+    @property
+    def dtype(self):
+        return eval(f'jnp.{self.torch_dtype}')
+
 def load_config(model_name, cls=Config):
     with open(f'{model_name}/config.json', 'r') as f:
         config_dict = json.load(f)
     return cls(**{k: v for k, v in config_dict.items() if k in {f.name for f in fields(cls)}})
 
 
-class Roper:
-    def __init__(self, head_dim, theta=10000.0, traditional=True):
+class Roper(nnx.Module):
+    def __init__(self, head_dim, theta=10000.0, traditional=False):
         dim = head_dim // 2
-        self.freq = 1.0 / (theta ** (jnp.arange(0, dim, dtype=jnp.float32) / dim))
+        self.freq = nnx.Variable(1.0 / (theta ** (jnp.arange(0, dim, dtype=jnp.float32) / dim)))
 
+    @nnx.jit
     def __call__(self, positions):
         positions = positions[:, None, :, None]
         angles = positions * self.freq
@@ -122,8 +129,7 @@ def apply_rope(q, k, cos, sin):
         k_split[..., 0, :] * cos - k_split[..., 1, :] * sin,
         k_split[..., 1, :] * cos + k_split[..., 0, :] * sin,
     ], axis=-1)
-    return q_out, k_out
-
+    return q_out.astype(q.dtype), k_out.astype(k.dtype)
 
 @jax.jit
 def apply_partial_rope(q, k, cos, sin, partial_rotary_factor=0.5): # mock
@@ -149,14 +155,14 @@ def apply_partial_rope(q, k, cos, sin, partial_rotary_factor=0.5): # mock
     ).reshape(k_rot.shape)
     q_out = jnp.concatenate([q_rotated, q_pass], axis=-1)
     k_out = jnp.concatenate([k_rotated, k_pass], axis=-1)
-    return q_out, k_out
+    return q_out.astype(q.dtype), k_out.astype(k.dtype)
 
 @jax.jit
 def create_causal_mask(padding_mask):
     padding_mask = jnp.array(padding_mask)
     seq_length = padding_mask.shape[1]
     causal_matrix = jnp.tril(jnp.ones((seq_length, seq_length), dtype=bool))
-    causal_mask = jnp.where(causal_matrix & padding_mask[:, None, :], 0.0, -1e10)
+    causal_mask = jnp.where(causal_matrix & padding_mask[:, None, :], 0.0, -1e4)
     return causal_mask[:, None, :, :]
 
 def measure_performance(start_time, prompt_time, end_time, batch_size, seq_length, gen_length):
@@ -174,86 +180,129 @@ def measure_performance(start_time, prompt_time, end_time, batch_size, seq_lengt
         "generation_tokens": tokens_generated,
         "generation_time": generation_duration
     }
+    print('\n\n=== Benchmarks ===')
     print(f"Prompt processing: {prompt_throughput:.1f} tokens/sec ({tokens_processed} tokens in {prompt_duration:.1f}s)")
     print(f"Token generation: {generation_throughput:.1f} tokens/sec ({tokens_generated} tokens in {generation_duration:.1f}s)")
     return metrics
 
+class Cache(nnx.Module):
+    def __init__(self, dtype, batch_size, num_heads, max_len, head_dim, k=None, v=None):
+        self.max_len = max_len
+        self.k = nnx.Variable(jnp.zeros((batch_size, num_heads, max_len, head_dim), dtype=dtype)) if k is None else nnx.Variable(k)
+        self.v = nnx.Variable(jnp.zeros((batch_size, num_heads, max_len, head_dim), dtype=dtype)) if v is None else nnx.Variable(v)
+
+    @nnx.jit
+    def __call__(self, k, v):
+        self.k.value = jnp.concat([self.k.value, k], axis=2)[:,:,-self.max_len:,:]
+        self.v.value = jnp.concat([self.v.value, v], axis=2)[:,:,-self.max_len:,:]
+        return self.k.value, self.v.value
+
 def load_model(
     model_id: str, 
     model_cls: Type, 
+    model_dir: str = None,
     config_cls: Type = Config,
-    model_creator: Callable = None
+    model_creator: Callable = None,
 ):
     repo_name, model_name = model_id.split('/')
-    download_model(repo_name, model_name)
-    config = load_config(model_name, cls=config_cls)
+    model_dir = download_model(repo_name, model_name, model_dir)
+    config = load_config(model_dir, cls=config_cls)
+    dtype = config.dtype
     if model_creator:
         graphdef, state = model_creator(config)
     else:
         graphdef, state = nnx.split(nnx.eval_shape(lambda: model_cls(config, rngs=nnx.Rngs(0))))
     state = dict(state.flat_state())
-    for fpath in glob(f"{model_name}/model*.safetensors"):
-        for path, val in ((k.replace("norm.weight", "norm.scale").replace("proj.weight", "proj.kernel").replace("mlp.weight", "mlp.kernel").replace("lm_head.weight", "lm_head.kernel").replace("embed_tokens.weight", "embed_tokens.embedding"), nnx.Param(jnp.array(v).T) if k.endswith('proj.weight') or k.endswith('mlp.weight') or k.endswith('lm_head.weight') else nnx.Param(jnp.array(v))) for k, v in load_file(fpath).items()):
+    for fpath in glob(f"{model_dir}/model*.safetensors"):
+        for path, val in ((k.replace("norm.weight", "norm.scale").replace("proj.weight", "proj.kernel").replace("mlp.weight", "mlp.kernel").replace("lm_head.weight", "lm_head.kernel").replace("embed_tokens.weight", "embed_tokens.embedding"), jnp.array(v, dtype=dtype).T if k.endswith('proj.weight') or k.endswith('mlp.weight') or k.endswith('lm_head.weight') else jnp.array(v, dtype=dtype)) for k, v in load_file(fpath).items()):
             path_tuple = tuple(int(part) if part.isdigit() else part for part in path.split('.'))
             if path_tuple in state:
                 state[path_tuple].value = val
             else:
                 print(f'{path_tuple} missing')
     model = nnx.merge(graphdef, nnx.State.from_flat_path(state))
-    dtype = eval(f'jnp.{config.torch_dtype}')
     model.set_attributes(dtype=dtype, param_dtype=dtype)
-    tokenizer = Tokenizer(repo_name=repo_name, model_name=model_name)
+    tokenizer = Tokenizer(repo_name='local', model_name=model_dir)
     return model, tokenizer, config
+
 
 def generate(
     model_id: str,
     model_cls: Type,
+    model_dir: str = 'models',
     config_cls: Type = Config,
     prompts = None, 
-    max_new_tokens: int = 5,
+    max_new_tokens: int = 100,
     use_chat_template: bool = True,
     custom_tokenizer_fn: Callable = None,
-    model_creator: Callable = None
+    model_creator: Callable = None,
+    stream = True,
+    use_scan = False,
+    use_jit = False,
+    **kwargs
 ):
     if prompts is None:
         if use_chat_template:
             prompts = "Give me a short introduction to large language model."
         else:
-            prompts = ["#write a quick sort algorithm", "#hello world"]
-    model, tokenizer, config = load_model(model_id, model_cls, config_cls, model_creator)
+            prompts = ["#write a quick sort algorithm\n", "#hello world in C\n"]
+    model, tokenizer, config = load_model(model_id, model_cls, model_dir, config_cls, model_creator)
     if use_chat_template:
         assert isinstance(prompts, str)
         prompts = [{"role": "user", "content": prompts}]
-    input_ids, position_ids, padding_mask = tokenizer(prompts, use_chat_template=use_chat_template, strftime_now=strftime_now)
-    causal_mask = create_causal_mask(padding_mask)
+        if 'add_generation_prompt' not in kwargs:
+            kwargs['add_generation_prompt'] = True
+    input_str, input_ids, position_ids, padding_mask = tokenizer(prompts, use_chat_template=use_chat_template, strftime_now=strftime_now, **kwargs)
     input_ids = jnp.array(input_ids, dtype=jnp.int32)
     B, L = input_ids.shape
     position_ids = jnp.array(position_ids, dtype=jnp.float32)
     roper = Roper(config.head_dim, config.rope_theta, config.rope_traditional)
-    output_ids = []
+    total_len = max_new_tokens + L
+    causal_mask = create_causal_mask(padding_mask).astype(config.dtype)
+    causal_mask = jnp.pad(causal_mask, ((0,0), (0,0), (0,0), (max_new_tokens,0)), 'constant', constant_values=-1e4).astype(config.dtype) # new!
     generated_texts = [""] * B
-    cache = None
+    cache = [Cache(config.dtype, B, config.num_key_value_heads, total_len, config.head_dim) for _ in range(config.num_hidden_layers)]
+    goon = jnp.ones((B, 1), dtype=bool)
+    eos_id = config.eos_token_id if isinstance(config.eos_token_id, int) else config.eos_token_id[0] # ad hoc
     start_tic = time.perf_counter()
-    for i in range(max_new_tokens):
+    def scan_step(carry):
+        input_ids, position_ids, causal_mask, cache, goon = carry
         rope = roper(position_ids)
-        logits, cache = model(input_ids, causal_mask, rope, cache)
-        if i == 0:
-            prompt_tic = time.perf_counter()
-        input_ids = jnp.argmax(logits[:, -1, :], axis=-1, keepdims=True)
-        new_tokens = input_ids.tolist()
-        print(f'{new_tokens=}')
-        for b, token_id in enumerate(new_tokens):
-            token_text = tokenizer.decode(token_id)
-            generated_texts[b] += token_text
-            print(f"Batch {b}, Token {i+1}: {token_text!r} -> {generated_texts[b]!r}")
-        output_ids.append(input_ids)
-        position_ids = position_ids[:, -1:] + 1
-        causal_mask = jnp.pad(causal_mask[:, :, -1:, :], ((0, 0), (0, 0), (0, 0), (0, 1)), 'constant', constant_values=0)
+        logits = model(input_ids, causal_mask, rope, cache)
+        next_input_ids = jnp.argmax(logits[:, -1, :], axis=-1, keepdims=True)
+        next_input_ids = jnp.where(goon, next_input_ids, eos_id)
+        new_mask = jnp.pad(causal_mask[:, :, -1:, 1:], ((0,0), (0,0), (0,0), (0,1)), 'constant', constant_values=0)
+        goon = goon & (next_input_ids != eos_id)
+        next_position_ids = position_ids[:, -1:] + 1
+        new_carry = (next_input_ids, next_position_ids, new_mask, cache, goon)
+        return new_carry, next_input_ids
+    carry = (input_ids, position_ids, causal_mask, cache, jnp.ones((B, 1), dtype=bool))
+    carry, first_tok = scan_step(carry)
+    prompt_tic = time.perf_counter()
+    if use_scan:
+        scan_fn = nnx.scan(scan_step, in_axes=(nnx.Carry,), out_axes=(nnx.Carry, 1), length=max_new_tokens-1)
+        carry, output_ids = scan_fn(carry)
+        output_ids = jnp.concat([first_tok, jnp.squeeze(output_ids, -1)], axis=1).tolist()
+    else:
+        output_ids = [first_tok]
+        if use_jit:
+            scan_fn = nnx.jit(scan_step)
+        else:
+            scan_fn = scan_step
+        for i in range(max_new_tokens-1):
+            if stream:
+                print(tokenizer.decode(output_ids[-1].tolist()[0]), end='', flush=True)
+            carry, _output_ids = scan_fn(carry)
+            output_ids.append(_output_ids)
+            if not jnp.any(carry[-1]):
+                break
+        output_ids = jnp.concat(output_ids, axis=1).tolist()
+
     end_tic = time.perf_counter()
+    for i, (i_str, o_ids) in enumerate(zip(input_str, output_ids)):
+        o_ids = o_ids[:o_ids.index(eos_id)] if eos_id in o_ids else o_ids
+        o_str = tokenizer.decode(o_ids)
+        print(f'\n=== Input ===\n{i_str}\n=== Output===\n{o_str}\n')
     measure_performance(start_tic, prompt_tic, end_tic, B, L, max_new_tokens)
-    output_ids = jnp.concatenate(output_ids, axis=1).tolist()
-    output_str = [tokenizer.decode(o) for o in output_ids]
-    print(f'{output_ids=}')
-    print(f'{output_str=}')
     return generated_texts, output_ids
 
