@@ -1,12 +1,7 @@
 import jax
 import jax.numpy as jnp
 from flax import nnx
-
-from .utils import (
-# from utils import (
-    apply_partial_rope,
-    generate,
-)
+from .utils import apply_partial_rope
 
 class Glm4MLP(nnx.Module):
     def __init__(self, config, *, rngs: nnx.Rngs):
@@ -104,9 +99,8 @@ class Glm4ForCausalLM(nnx.Module):
             rngs=rngs
         )
     
+    @nnx.jit
     def __call__(self, input_ids, attention_mask, rope, cache):
         x = self.model(input_ids, attention_mask=attention_mask, rope=rope, cache=cache)
         return self.lm_head(x)
 
-if __name__ == "__main__":
-    generate(model_id='THUDM/GLM-4-9B-0414', model_cls=Glm4ForCausalLM)

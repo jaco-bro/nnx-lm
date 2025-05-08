@@ -1,13 +1,7 @@
 import jax
 import jax.numpy as jnp
 from flax import nnx
-
-from .utils import (
-# from utils import (
-    apply_rope, 
-    load_model,
-    generate
-)
+from .utils import apply_rope
 
 class Attention(nnx.Module):
     def __init__(self, config, *, rngs: nnx.Rngs):
@@ -104,9 +98,4 @@ class Qwen3ForCausalLM(nnx.Module):
             x = self.lm_head(x)
         return x
 
-def main():
-    return generate(model_id='Qwen/Qwen3-0.6B', model_cls=Qwen3ForCausalLM, enable_thinking=False, use_chat_template=True)
-
-if __name__ == "__main__":
-    main()
 

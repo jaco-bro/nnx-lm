@@ -23,7 +23,7 @@ setup(
     name='nnx-lm',
     url='https://github.com/jaco-bro/nnx-lm',
     packages=find_packages(),
-    version='0.0.1',
+    version='0.0.2',
     readme="README.md",
     author_email="backupjjoe@gmail.com",
     description="nnx-lm: A portable, pip-installable CLI for running LLMs via JAX on any hardware backend.",
@@ -36,7 +36,7 @@ setup(
     extras_require=extras_require,
     entry_points={
         "console_scripts": [
-            "nlm=nnxlm.qwen3:main",
+            "nlm=nnxlm.main:cli",
         ],
     },
 )

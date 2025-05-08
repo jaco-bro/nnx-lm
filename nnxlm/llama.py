@@ -1,12 +1,7 @@
 import jax
 import jax.numpy as jnp
 from flax import nnx
-
-from .utils import (
-# from utils import (
-    apply_rope,
-    generate
-)
+from .utils import apply_rope
 
 class Attention(nnx.Module):
     def __init__(self, config, *, rngs: nnx.Rngs):
@@ -109,5 +104,3 @@ class LlamaForCausalLM(nnx.Module):
             x = self.lm_head(x)
         return x
 
-if __name__ == "__main__":
-    generate(model_id='HuggingFaceTB/SmolLM2-135M', model_cls=LlamaForCausalLM, use_chat_template=False)

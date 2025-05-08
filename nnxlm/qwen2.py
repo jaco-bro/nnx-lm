@@ -1,12 +1,7 @@
 import jax
 import jax.numpy as jnp
 from flax import nnx
-
-from .utils import (
-# from utils import (
-    apply_rope,
-    generate
-)
+from .utils import apply_rope
 
 class Attention(nnx.Module):
     def __init__(self, config, *, rngs: nnx.Rngs):
@@ -76,6 +71,7 @@ class Qwen2Model(nnx.Module):
         self.embed_tokens = nnx.Embed(num_embeddings=config.vocab_size, features=config.hidden_size, rngs=rngs)
         self.norm = nnx.RMSNorm(num_features=config.hidden_size, epsilon=config.rms_norm_eps, rngs=rngs)
     
+    @nnx.jit
     def __call__(self, input_ids, attention_mask, rope, cache):
         x = self.embed_tokens(input_ids)
         for i, layer in enumerate(self.layers):
@@ -89,6 +85,7 @@ class Qwen2ForCausalLM(nnx.Module):
         if not tie:
             self.lm_head = nnx.Linear(in_features=config.hidden_size, out_features=config.vocab_size, use_bias=False, rngs=rngs)
     
+    @nnx.jit
     def __call__(self, input_ids, attention_mask, rope, cache):
         x = self.model(input_ids, attention_mask=attention_mask, rope=rope, cache=cache)
         if self.tie:
@@ -97,5 +94,3 @@ class Qwen2ForCausalLM(nnx.Module):
             x = self.lm_head(x)
         return x
 
-if __name__ == "__main__":
-    generate(model_id='Qwen/Qwen2.5-Coder-0.5B', model_cls=Qwen2ForCausalLM, use_chat_template=False)

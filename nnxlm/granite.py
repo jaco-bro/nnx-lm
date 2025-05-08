@@ -1,21 +1,7 @@
 import jax
 import jax.numpy as jnp
 from flax import nnx
-from dataclasses import dataclass
-
-from .utils import (
-# from utils import (
-    Config,
-    apply_rope,
-    generate,
-)
-
-@dataclass
-class GraniteConfig(Config):
-    logits_scaling: float = 1.0
-    attention_multiplier: float = 1.0
-    embedding_multiplier: float = 1.0
-    residual_multiplier: float = 1.0
+from .utils import apply_rope
 
 class Attention(nnx.Module):
     def __init__(self, config, *, rngs: nnx.Rngs):
@@ -114,5 +100,3 @@ class GraniteForCausalLM(nnx.Module):
             x = self.lm_head(x)
         return x / self.logits_scaling
 
-if __name__ == "__main__":
-    generate(model_id='ibm-granite/granite-3.3-2b-instruct', model_cls=GraniteForCausalLM, config_cls=GraniteConfig)
