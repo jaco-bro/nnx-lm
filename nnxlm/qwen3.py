@@ -32,7 +32,8 @@ class Attention(nnx.Module):
         q = self.q_norm(q)
         k = self.k_norm(k)
         q, k = apply_rope(q, k, *rope)
-        k, v = cache(k, v)
+        if cache is not None:
+            k, v = cache(k, v)
         if self.n_repeat > 1:
             k = jnp.repeat(k, repeats=self.n_repeat, axis=1)
             v = jnp.repeat(v, repeats=self.n_repeat, axis=1)

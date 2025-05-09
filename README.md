@@ -1,10 +1,23 @@
-# nnx-lm: A portable, pip-installable CLI for running LLMs via JAX on any hardware backend.
+# nnx-lm
+A collection of open-weight LLMs implemented in JAX using `flax.NNX` — no Torch, no HuggingFace Transformers (**not even for tokenizers**).
+
+## Supported Models
+
+- `Qwen/Qwen3-0.6B`
+- `Qwen/Qwen2.5-Coder-0.5B`
+- `microsoft/Phi-4-mini-instruct`
+- `ibm-granite/granite-3.3-2b-instruct`
+- `THUDM/GLM-4-9B-0414`
+- `HuggingFaceTB/SmolLM2-135M`
+- `meta-llama/Llama-3.2-1B-Instruct`
+
+All models run without PyTorch or `transformers`, using a custom tokenizer and model loader.
 
 ## Quick Start
 
 ```fish
 pip install nnx-lm
-nlm
+nlm -p "Give me a short introduction to large language model.\n"
 ```
 
 ```
@@ -30,7 +43,7 @@ Token generation: 22.8 tokens/sec (100 tokens in 4.4s)
 Scan:
 
 ```fish
-nlm --scan
+nlm --scan -p "Give me a short introduction to large language model.\n"
 ```
 
 ```
@@ -57,7 +70,7 @@ Token generation: 76.0 tokens/sec (100 tokens in 1.3s)
 Batch:
 
 ```fish
-nlm --no-format
+nlm -p "Give me a short introduction to large language model.\n"  "#write a quick sort algorithm\n"
 ```
 
 ```
@@ -92,7 +105,8 @@ Token generation: 45.0 tokens/sec (200 tokens in 4.4s)
 Batched scan:
 
 ```fish
-nlm --no-format --scan
+nlm --scan -p "Give me a short introduction to large language model.\n" "#write a quick sort algorithm\n"
+
 ```
 
 ```
@@ -104,7 +118,7 @@ Token generation: 135.7 tokens/sec (200 tokens in 1.5s)
 Jit:
 
 ```fish
-nlm --jit
+nlm --jit -p "Give me a short introduction to large language model.\n"
 ```
 
 ```
@@ -135,7 +149,7 @@ Python:
 ```python
 import nnxlm as nl
 m = nl.load('Qwen/Qwen3-0.6B')
-nl.generate(*m)
+nl.generate(*m, ["#write a quick sort algorithm\n", "Give me a short introduction to large language model.\n"])
 ```
 
 Test:

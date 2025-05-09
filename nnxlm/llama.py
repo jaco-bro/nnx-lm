@@ -30,7 +30,8 @@ class Attention(nnx.Module):
         k = jnp.transpose(k, (0, 2, 1, 3))
         v = jnp.transpose(v, (0, 2, 1, 3))
         q, k = apply_rope(q, k, *rope)
-        k, v = cache(k, v)
+        if cache is not None:
+            k, v = cache(k, v)
         if self.n_repeat > 1:
             k = k.repeat(repeats=self.n_repeat, axis=1)
             v = v.repeat(repeats=self.n_repeat, axis=1)

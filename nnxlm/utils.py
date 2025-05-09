@@ -1,7 +1,9 @@
 from datetime import datetime
 import os
+import functools
 import json
 import time
+import math
 import jax
 import jax.numpy as jnp
 from urllib.request import urlretrieve
@@ -13,6 +15,7 @@ from flax import nnx
 from safetensors.flax import load_file
 from glob import glob
 from tokenizerz import Tokenizer
+from pathlib import Path
 
 def strftime_now(format="%Y-%m-%d %H:%M:%S"):
     return datetime.now().strftime(format)
@@ -85,12 +88,14 @@ class Config:
     attention_bias: bool = True
     mlp_bias: bool = False
     rope_traditional: bool = True
-    partial_rotary_factor: float = 0.5
+    partial_rotary_factor: float = 1.0
     max_position_embeddings: Optional[int] = None
+    original_max_position_embeddings: Optional[int] = None
     logits_scaling: float = 1.0
     attention_multiplier: float = 1.0
     embedding_multiplier: float = 1.0
     residual_multiplier: float = 1.0
+    extra_config: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
         if self.num_key_value_heads is None:
@@ -102,10 +107,26 @@ class Config:
     def dtype(self):
         return eval(f'jnp.{self.torch_dtype}')
 
+def get_nested(d, keys, default=None):
+    if not isinstance(d, dict):
+        return default
+    for key in keys:
+        if isinstance(d, dict) and key in d:
+            d = d[key]
+        else:
+            return default
+    return d
+
 def load_config(model_name, cls=Config):
-    with open(f'{model_name}/config.json', 'r') as f:
+    with open(Path(model_name) / 'config.json', 'r') as f:
         config_dict = json.load(f)
-    return cls(**{k: v for k, v in config_dict.items() if k in {f.name for f in fields(cls)}})
+    cls_fields = {f.name for f in fields(cls)}
+    init_args = {k: v for k, v in config_dict.items() if k in cls_fields}
+    extra_args = {}
+    for k, v in config_dict.items():
+        if k not in cls_fields:
+            extra_args[k] = v
+    return cls(**init_args, extra_config=extra_args)
 
 def load_model(model_dir, config, cls, model_creator=None):
     dtype = config.dtype
@@ -127,57 +148,84 @@ def load_model(model_dir, config, cls, model_creator=None):
     return model, tokenizer
 
 class Roper(nnx.Module):
-    def __init__(self, head_dim, theta=10000.0, traditional=False):
-        dim = head_dim // 2
-        self.freq = nnx.Variable(1.0 / (theta ** (jnp.arange(0, dim, dtype=jnp.float32) / dim)))
+    def __init__(self, config, su_len):
+        self.su_scale = 1.0
+        if get_nested(config.extra_config, ["rope_scaling", "rope_type"])=='llama3':
+            self._llama3(config)
+        elif get_nested(config.extra_config, ["rope_scaling", "type"])=='longrope':
+            self._su(config, su_len)
+        else:
+            dim = int(config.head_dim*config.partial_rotary_factor/2)
+            self.freq = nnx.Variable(1.0 / (config.rope_theta ** (jnp.arange(0, dim, dtype=jnp.float32) / dim)))
 
     @nnx.jit
     def __call__(self, positions):
         positions = positions[:, None, :, None]
         angles = positions * self.freq
-        cos = jnp.cos(angles)
-        sin = jnp.sin(angles)
-        return cos, sin
+        cos = jnp.cos(angles) * self.su_scale
+        sin = jnp.sin(angles) * self.su_scale
+        return jax.lax.stop_gradient(cos), jax.lax.stop_gradient(sin)
+    
+    def _llama3(self, config):
+        rot_dims = int(config.head_dim * config.partial_rotary_factor)
+        scaling_config = get_nested(config.extra_config, ["rope_scaling"])
+        factor = scaling_config.get("factor", 1.0)
+        low_freq_factor = scaling_config.get("low_freq_factor", 1.0)
+        high_freq_factor = scaling_config.get("high_freq_factor", 4.0)
+        old_max = scaling_config.get("original_max_position_embeddings", 8192)
+        idx = jnp.arange(0, rot_dims, 2, dtype=jnp.float32)
+        freqs = config.rope_theta ** (idx / rot_dims)
+        wavelens = 2 * jnp.pi * freqs
+        low_wl = old_max / low_freq_factor
+        high_wl = old_max / high_freq_factor
+        freqs_adj = jnp.where(wavelens > low_wl, freqs * factor, freqs)
+        is_med = (wavelens > high_wl) & (wavelens < low_wl)
+        smooth = (old_max / wavelens - low_freq_factor) / (high_freq_factor - low_freq_factor)
+        smooth_freqs = freqs_adj / ((1 - smooth) / factor + smooth)
+        freqs_final = jnp.where(is_med, smooth_freqs, freqs_adj)
+        self.freq = nnx.Variable(1.0 / freqs_final)
 
-@jax.jit
-def apply_rope(q, k, cos, sin):
-    q_split = q.reshape(*q.shape[:-1], 2, -1)
-    k_split = k.reshape(*k.shape[:-1], 2, -1)
-    q_out = jnp.concatenate([
-        q_split[..., 0, :] * cos - q_split[..., 1, :] * sin,
-        q_split[..., 1, :] * cos + q_split[..., 0, :] * sin,
-    ], axis=-1)
-    k_out = jnp.concatenate([
-        k_split[..., 0, :] * cos - k_split[..., 1, :] * sin,
-        k_split[..., 1, :] * cos + k_split[..., 0, :] * sin,
-    ], axis=-1)
-    return q_out.astype(q.dtype), k_out.astype(k.dtype)
+    def _su(self, config, su_len):
+        factor = 'long' if su_len > config.original_max_position_embeddings else 'short'
+        self.su_scale = math.sqrt(1.0 + math.log(config.max_position_embeddings / config.original_max_position_embeddings) / math.log(config.original_max_position_embeddings))
+        rot_dims = int(config.head_dim * config.partial_rotary_factor)
+        scaling_config = get_nested(config.extra_config, ["rope_scaling"])
+        freqs = config.rope_theta ** (jnp.arange(0, rot_dims, 2, dtype=jnp.float32) / rot_dims)
+        factor = scaling_config.get(f'{factor}_factor')
+        factor = jnp.array(factor, dtype=jnp.float32)
+        self.freq = nnx.Variable(1.0 / (freqs * factor))
 
-@jax.jit
-def apply_partial_rope(q, k, cos, sin, partial_rotary_factor=0.5): # mock
-    D = q.shape[-1]
-    rot_D = D // 2
-    q_rot, q_pass = q[..., :rot_D], q[..., rot_D:]
-    k_rot, k_pass = k[..., :rot_D], k[..., rot_D:]
-    q_pair = q_rot.reshape(*q_rot.shape[:-1], rot_D // 2, 2)
-    k_pair = k_rot.reshape(*k_rot.shape[:-1], rot_D // 2, 2)
-    q_even, q_odd = q_pair[..., 0], q_pair[..., 1]
-    k_even, k_odd = k_pair[..., 0], k_pair[..., 1]
-    cos_pair = cos[..., : rot_D // 2]
-    sin_pair = sin[..., : rot_D // 2]
-    q_rotated = jnp.stack(
-        [q_even * cos_pair - q_odd * sin_pair,
-         q_even * sin_pair + q_odd * cos_pair],
-        axis=-1,
-    ).reshape(q_rot.shape)
-    k_rotated = jnp.stack(
-        [k_even * cos_pair - k_odd * sin_pair,
-         k_even * sin_pair + k_odd * cos_pair],
-        axis=-1,
-    ).reshape(k_rot.shape)
-    q_out = jnp.concatenate([q_rotated, q_pass], axis=-1)
-    k_out = jnp.concatenate([k_rotated, k_pass], axis=-1)
-    return q_out.astype(q.dtype), k_out.astype(k.dtype)
+@functools.partial(jax.jit, static_argnames=['rot_dims', 'traditional'])
+def apply_rope(q, k, cos, sin, rot_dims=None, traditional=False):
+    if rot_dims is None:
+        q_rot, k_rot = q, k
+    else:
+        q_rot, q_pass = q[..., :rot_dims], q[..., rot_dims:]
+        k_rot, k_pass = k[..., :rot_dims], k[..., rot_dims:]
+    if traditional:
+        q_even = q_rot[..., 0::2]
+        q_odd  = q_rot[..., 1::2]
+        k_even = k_rot[..., 0::2]
+        k_odd  = k_rot[..., 1::2]
+        q_rotated = jnp.stack([(q_even * cos - q_odd * sin), (q_even * sin + q_odd * cos)], axis=-1).reshape(q_rot.shape).astype(q.dtype)
+        k_rotated = jnp.stack([(k_even * cos - k_odd * sin), (k_even * sin + k_odd * cos)], axis=-1).reshape(k_rot.shape).astype(k.dtype)
+    else:
+        q_split = q_rot.reshape(*q.shape[:-1], 2, -1)
+        k_split = k_rot.reshape(*k.shape[:-1], 2, -1)
+        q_rotated = jnp.concatenate([
+            q_split[..., 0, :] * cos - q_split[..., 1, :] * sin,
+            q_split[..., 1, :] * cos + q_split[..., 0, :] * sin,
+        ], axis=-1).astype(q.dtype)
+        k_rotated = jnp.concatenate([
+            k_split[..., 0, :] * cos - k_split[..., 1, :] * sin,
+            k_split[..., 1, :] * cos + k_split[..., 0, :] * sin,
+        ], axis=-1).astype(k.dtype)
+    if rot_dims is None:
+        return q_rotated, k_rotated
+    else:
+        q_out = jnp.concatenate([q_rotated, q_pass], axis=-1)
+        k_out = jnp.concatenate([k_rotated, k_pass], axis=-1)
+        return q_out, k_out
 
 @jax.jit
 def create_causal_mask(padding_mask):
@@ -223,7 +271,7 @@ def generate(
     model,
     tokenizer,
     config,
-    prompts = None, 
+    prompts, 
     max_new_tokens: int = 100,
     use_chat_template: bool = True,
     custom_tokenizer_fn: Callable = None,
@@ -233,25 +281,24 @@ def generate(
     use_jit = False,
     **kwargs
 ):
-    if prompts is None:
-        if use_chat_template:
-            prompts = "Give me a short introduction to large language model."
-        else:
-            prompts = ["#write a quick sort algorithm\n", "Give me a short introduction to large language model.\n"]
+    if isinstance(prompts, str):
+        prompts = [prompts]
     if use_chat_template:
-        assert isinstance(prompts, str)
-        prompts = [{"role": "user", "content": prompts}]
-        if 'add_generation_prompt' not in kwargs:
-            kwargs['add_generation_prompt'] = True
-    input_str, input_ids, position_ids, padding_mask = tokenizer(prompts, use_chat_template=use_chat_template, strftime_now=strftime_now, **kwargs)
+        try:
+            if 'add_generation_prompt' not in kwargs:
+                kwargs['add_generation_prompt'] = True
+            prompts = [tokenizer.apply_chat_template([{"role": "user", "content": prompt}], strftime_now=strftime_now, **kwargs) for prompt in prompts]
+        except Exception as e:
+            print(e)
+    # input_str, input_ids, position_ids, padding_mask = tokenizer(prompts, use_chat_template=use_chat_template, strftime_now=strftime_now, **kwargs)
+    input_str, input_ids, position_ids, padding_mask = tokenizer(prompts)
     input_ids = jnp.array(input_ids, dtype=jnp.int32)
     B, L = input_ids.shape
     position_ids = jnp.array(position_ids, dtype=jnp.float32)
-    roper = Roper(config.head_dim, config.rope_theta, config.rope_traditional)
     total_len = max_new_tokens + L
+    roper = Roper(config, total_len)
     causal_mask = create_causal_mask(padding_mask).astype(config.dtype)
     causal_mask = jnp.pad(causal_mask, ((0,0), (0,0), (0,0), (max_new_tokens,0)), 'constant', constant_values=-1e4).astype(config.dtype)
-    generated_texts = [""] * B
     cache = [Cache(config.dtype, B, config.num_key_value_heads, total_len, config.head_dim) for _ in range(config.num_hidden_layers)]
     zeropad = jnp.zeros((B, 1, 1, 1), dtype=config.dtype)
     goon = jnp.ones((B, 1), dtype=bool)
@@ -291,9 +338,11 @@ def generate(
         output_ids = jnp.concat(output_ids, axis=1).tolist()
 
     end_tic = time.perf_counter()
+    output_str = []
     for i, (i_str, o_ids) in enumerate(zip(input_str, output_ids)):
         o_ids = o_ids[:o_ids.index(eos_id)] if eos_id in o_ids else o_ids
         o_str = tokenizer.decode(o_ids)
+        output_str.append(o_str)
         print(f'\n=== Input ===\n{i_str}\n=== Output===\n{o_str}\n')
     measure_performance(start_tic, prompt_tic, end_tic, B, L, max_new_tokens)
-    return generated_texts, output_ids
+    return output_str, output_ids

@@ -1,7 +1,7 @@
 import jax
 import jax.numpy as jnp
 from flax import nnx
-from .utils import apply_partial_rope
+from .utils import apply_rope
 
 class Glm4MLP(nnx.Module):
     def __init__(self, config, *, rngs: nnx.Rngs):
@@ -20,12 +20,13 @@ class Glm4Attention(nnx.Module):
         self.n_heads = config.num_attention_heads
         self.n_kv_heads = config.num_key_value_heads
         self.scale = self.head_dim ** -0.5
-        self.partial_rotary_factor = config.partial_rotary_factor
+        self.rot_dims=int(self.head_dim*config.partial_rotary_factor)
         self.q_proj = nnx.Linear(in_features=config.hidden_size, out_features=self.n_heads * self.head_dim, use_bias=config.attention_bias, rngs=rngs)
         self.k_proj = nnx.Linear(in_features=config.hidden_size, out_features=self.n_kv_heads * self.head_dim, use_bias=config.attention_bias, rngs=rngs)
         self.v_proj = nnx.Linear(in_features=config.hidden_size, out_features=self.n_kv_heads * self.head_dim, use_bias=config.attention_bias, rngs=rngs)
         self.o_proj = nnx.Linear(in_features=self.n_heads * self.head_dim, out_features=config.hidden_size, use_bias=False, rngs=rngs)
         self.rope_theta = config.rope_theta
+        self.rope_traditional = True
     
     @nnx.jit
     def __call__(self, x, attention_mask, rope, cache):
@@ -39,8 +40,9 @@ class Glm4Attention(nnx.Module):
         q = jnp.transpose(q, (0, 2, 1, 3))
         k = jnp.transpose(k, (0, 2, 1, 3))
         v = jnp.transpose(v, (0, 2, 1, 3))
-        q, k = apply_partial_rope(q, k, *rope, self.partial_rotary_factor)
-        k, v = cache(k, v)
+        q, k = apply_rope(q, k, *rope, self.rot_dims, self.rope_traditional)
+        if cache is not None:
+            k, v = cache(k, v)
         if self.n_heads > self.n_kv_heads:
             repeat_factor = self.n_heads // self.n_kv_heads
             k = jnp.repeat(k, repeats=repeat_factor, axis=1)

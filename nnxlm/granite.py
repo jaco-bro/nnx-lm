@@ -29,7 +29,8 @@ class Attention(nnx.Module):
         k = jnp.transpose(k, (0, 2, 1, 3))
         v = jnp.transpose(v, (0, 2, 1, 3))
         q, k = apply_rope(q, k, *rope)
-        k, v = cache(k, v)
+        if cache is not None:
+            k, v = cache(k, v)
         if self.n_repeat > 1:
             k = jnp.repeat(k, repeats=self.n_repeat, axis=1)
             v = jnp.repeat(v, repeats=self.n_repeat, axis=1)
@@ -84,7 +85,6 @@ class GraniteModel(nnx.Module):
     
 class GraniteForCausalLM(nnx.Module):
     def __init__(self, config, *, rngs: nnx.Rngs):
-        print(f'{config=}')
         self.tie = tie = config.tie_word_embeddings
         self.model = GraniteModel(config, rngs=rngs)
         if not tie:
