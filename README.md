@@ -1,5 +1,5 @@
 # nnxlm
-A collection of open-weight LLMs implemented in JAX using `flax.NNX` — no Torch, no HuggingFace Transformers (**not even for tokenizers**).
+Run pretrained LLMs on any hardware (CPU, GPU, TPU, MPS, etc) in JAX using `flax.NNX` — no Torch, no HuggingFace Transformers (not even for the **tokenizers**).
 
 ## Supported Models
 
