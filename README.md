@@ -1,4 +1,5 @@
 # nnxlm
+![Alt text](https://raw.githubusercontent.com/jaco-bro/nnx-lm/main/assets/nnxlm.png)
 Run pretrained LLMs on any hardware (CPU, GPU, TPU, MPS, etc) in JAX using `flax.NNX` — no Torch, no HuggingFace Transformers (not even for the **tokenizers**).
 
 ## Supported Models

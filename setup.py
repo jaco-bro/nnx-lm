@@ -11,7 +11,7 @@ requirements = [
     "safetensors",
     "pydantic",
     "huggingface-hub",
-    "tokenizerz==0.0.2",
+    "tokenizerz==0.0.3a5",
 ]
 
 extras_require = {
